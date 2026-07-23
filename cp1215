@@ -1,0 +1,1199 @@
+#!/usr/bin/env python3
+"""HP Color LaserJet CP1215 Linux maintenance utility."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import stat
+import sys
+import time
+from collections.abc import Callable, Collection
+from dataclasses import dataclass
+from typing import TypedDict, TypeVar
+
+
+DEFAULT_DEVICE = "/dev/usb/lp0"
+UEL = b"\x1b%-12345X"
+DEFAULT_QUERY_TIMEOUT = 5.0
+DEFAULT_COMMAND_TIMEOUT = 2.0
+DEFAULT_QUERY_LIMIT = 65536
+DEFAULT_COMMAND_LIMIT = 8192
+STATUS_POLL_INTERVAL = 2.0
+DEVICE_STATUS_PATH = "/ssi/DeviceStatusPage.xml"
+SSI_CONFIG_PATH = "/ssi/xml_config.html"
+CLEANING_BUSY_CODES = frozenset({10023, 10031})
+CALIBRATION_BUSY_CODES = frozenset({10600, 10601, 10602})
+# Firmware-derived from DeviceStatusSupport, stable across the 2008, 2010,
+# and 2012 CP1210/CP1215 firmware images inspected in this workspace.
+STATUS_CODE_NAMES = {
+    0: "Unknown",
+    10001: "Ready",
+    10003: "Initializing",
+    10007: "Canceling job",
+    10014: "Printing internal page",
+    10017: "Printing demo page",
+    10023: "Printing",
+    10031: "Engine cleaning",
+    10037: "Cool-down mode",
+    10209: "Black toner low",
+    10210: "Cyan toner low",
+    10211: "Magenta toner low",
+    10212: "Yellow toner low",
+    10219: "Black toner very low",
+    10220: "Cyan toner very low",
+    10221: "Magenta toner very low",
+    10222: "Yellow toner very low",
+    10300: "Black toner out",
+    10301: "Cyan toner out",
+    10302: "Magenta toner out",
+    10303: "Yellow toner out",
+    10320: "Cartridge supply override active",
+    10321: "Cartridge supplies override active",
+    10322: "Black toner out override",
+    10323: "Cyan toner out override",
+    10324: "Magenta toner out override",
+    10325: "Yellow toner out override",
+    10403: "Unsupported or non-HP cartridge",
+    10404: "Unsupported or non-HP cyan cartridge",
+    10405: "Unsupported or non-HP yellow cartridge",
+    10406: "Unsupported or non-HP magenta cartridge",
+    10407: "Unsupported or non-HP black cartridge",
+    10500: "Wrong black cartridge",
+    10501: "Wrong cyan cartridge",
+    10502: "Wrong magenta cartridge",
+    10503: "Wrong yellow cartridge",
+    10504: "Cyan cartridge illegal",
+    10505: "Yellow cartridge illegal",
+    10506: "Magenta cartridge illegal",
+    10507: "Black cartridge illegal",
+    10508: "Cyan cartridge unauthorized",
+    10509: "Yellow cartridge unauthorized",
+    10510: "Magenta cartridge unauthorized",
+    10511: "Black cartridge unauthorized",
+    10512: "Cartridge unauthorized",
+    10600: "Calibration DMAX",
+    10601: "Calibration DHALF",
+    10602: "Calibration CPR",
+    30017: "Print overrun",
+    30020: "JBIG error",
+    30021: "JBIG write DMA error",
+    30022: "JBIG read DMA error",
+    30096: "Misprint paper size",
+    30119: "Input paper mispick",
+    30200: "Misprint reservation",
+    30201: "Misprint beam-detect error",
+    30202: "Misprint sending error",
+    40010: "Black cartridge memory error",
+    40011: "Cyan cartridge memory error",
+    40012: "Magenta cartridge memory error",
+    40013: "Yellow cartridge memory error",
+    40014: "Magenta cartridge bad e-label warning",
+    40015: "Yellow cartridge bad e-label warning",
+    40016: "Cyan cartridge bad e-label warning",
+    40017: "Black cartridge bad e-label warning",
+    40018: "Multiple cartridge bad e-label warnings",
+    40020: "Front door open",
+    40021: "Door open",
+    40120: "Begin manual duplex",
+    40121: "Manual duplex input",
+    40600: "Black cartridge missing",
+    40601: "Cyan cartridge missing",
+    40602: "Magenta cartridge missing",
+    40603: "Yellow cartridge missing",
+    40604: "Cyan cartridge mostly depleted",
+    40605: "Yellow cartridge mostly depleted",
+    40606: "Magenta cartridge mostly depleted",
+    40607: "Black cartridge mostly depleted",
+    40608: "Used black cartridge",
+    40610: "Used cyan cartridge",
+    40612: "Used magenta cartridge",
+    40614: "Used yellow cartridge",
+    40620: "Multiple cartridge toner-dam issue",
+    40621: "Black cartridge toner-dam issue",
+    40622: "Cyan cartridge toner-dam issue",
+    40623: "Magenta cartridge toner-dam issue",
+    40624: "Yellow cartridge toner-dam issue",
+    41000: "Paper out in tray 1",
+    41002: "Load tray 1 with letter",
+    41003: "Load tray 1 with legal",
+    41004: "Load tray 1 with A4",
+    41005: "Load tray 1 with executive",
+    41006: "Load tray 1 with tabloid",
+    41007: "Load tray 1 with A3",
+    41008: "Load tray 1 with #10 envelope",
+    41009: "Load tray 1 with Monarch envelope",
+    41010: "Load tray 1 with C5 envelope",
+    41011: "Load tray 1 with DL envelope",
+    41012: "Load tray 1 with B4",
+    41013: "Load tray 1 with B5",
+    41014: "Load tray 1 with B5 envelope",
+    41015: "Load tray 1 with custom media",
+    41016: "Load tray 1 with JIS B4",
+    41017: "Load tray 1 with JIS B5",
+    41018: "Load tray 1 with Japanese postcard",
+    41019: "Load tray 1 with Japanese double postcard",
+    41020: "Load tray 1 with A5",
+    41024: "Load tray 1 with A6",
+    41025: "Load tray 1 with folio",
+    41032: "Load tray 1 with 16K 195x270",
+    41033: "Load tray 1 with 16K 184x260",
+    41040: "Load tray 1 with 16K 197x273",
+    41043: "Load tray 1 with 8K 273x394",
+    41049: "Load tray 1 with #6 envelope",
+    41050: "Load tray 1 with 4x6 photo",
+    41051: "Load tray 1 with 5x8 photo",
+    41100: "Manual feed",
+    41200: "Paper out in tray 2",
+    41202: "Load tray 2 with letter",
+    41203: "Load tray 2 with legal",
+    41204: "Load tray 2 with A4",
+    41205: "Load tray 2 with executive",
+    41206: "Load tray 2 with tabloid",
+    41207: "Load tray 2 with A3",
+    41208: "Load tray 2 with #10 envelope",
+    41209: "Load tray 2 with Monarch envelope",
+    41210: "Load tray 2 with C5 envelope",
+    41211: "Load tray 2 with DL envelope",
+    41212: "Load tray 2 with B4",
+    41213: "Load tray 2 with B5",
+    41214: "Load tray 2 with B5 envelope",
+    41215: "Load tray 2 with custom media",
+    41216: "Load tray 2 with JIS B4",
+    41217: "Load tray 2 with JIS B5",
+    41218: "Load tray 2 with Japanese postcard",
+    41219: "Load tray 2 with Japanese double postcard",
+    41220: "Load tray 2 with A5",
+    41224: "Load tray 2 with A6",
+    41225: "Load tray 2 with folio",
+    41232: "Load tray 2 with 16K 195x270",
+    41233: "Load tray 2 with 16K 184x260",
+    41240: "Load tray 2 with 16K 197x273",
+    41243: "Load tray 2 with 8K 273x394",
+    41249: "Load tray 2 with #6 envelope",
+    41250: "Load tray 2 with 4x6 photo",
+    41251: "Load tray 2 with 5x8 photo",
+    41300: "Paper out in tray 3",
+    41302: "Load tray 3 with letter",
+    41303: "Load tray 3 with legal",
+    41304: "Load tray 3 with A4",
+    41305: "Load tray 3 with executive",
+    41306: "Load tray 3 with tabloid",
+    41307: "Load tray 3 with A3",
+    41308: "Load tray 3 with #10 envelope",
+    41309: "Load tray 3 with Monarch envelope",
+    41310: "Load tray 3 with C5 envelope",
+    41311: "Load tray 3 with DL envelope",
+    41312: "Load tray 3 with B4",
+    41313: "Load tray 3 with B5",
+    41314: "Load tray 3 with B5 envelope",
+    41315: "Load tray 3 with custom media",
+    41316: "Load tray 3 with JIS B4",
+    41317: "Load tray 3 with JIS B5",
+    41318: "Load tray 3 with Japanese postcard",
+    41319: "Load tray 3 with Japanese double postcard",
+    41320: "Load tray 3 with A5",
+    41324: "Load tray 3 with A6",
+    41325: "Load tray 3 with folio",
+    41332: "Load tray 3 with 16K 195x270",
+    41333: "Load tray 3 with 16K 184x260",
+    41340: "Load tray 3 with 16K 197x273",
+    41343: "Load tray 3 with 8K 273x394",
+    41349: "Load tray 3 with #6 envelope",
+    41350: "Load tray 3 with 4x6 photo",
+    41351: "Load tray 3 with 5x8 photo",
+    41900: "Paper out in all trays",
+    42000: "Paper jam in tray 1 area",
+    42001: "Paper jam in registration/drum area",
+    42002: "Paper jam in drum/fuser area",
+    42003: "Paper jam in output area",
+    42004: "Paper jam in duplex/reverse area",
+    42100: "Paper jam in tray 2 area",
+    42300: "Paper jam in tray 3 area",
+    50000: "Paper path ramp-up failure",
+    50001: "Paper path rotation failure",
+    50002: "Yellow scanner laser failure",
+    50003: "Magenta scanner laser failure",
+    50004: "Cyan scanner laser failure",
+    50005: "Black scanner laser failure",
+    50006: "Fuser warm-up failure",
+    50007: "Fuser low temperature failure",
+    50008: "Fuser high temperature failure",
+    50009: "Fuser heater wire failure",
+    50010: "Fuser sub-thermistor low temperature failure",
+    50011: "Fuser sub-thermistor high temperature failure",
+    50012: "Controller failure",
+    50013: "Density sensor warning",
+    50014: "CPR sensor warning",
+    50015: "Duplexer connection failure",
+    50016: "Cyan cartridge depleted",
+    50017: "Yellow cartridge depleted",
+    50018: "Magenta cartridge depleted",
+    50019: "Black cartridge depleted",
+    50020: "Fan error",
+    50021: "Engine communication fatal error",
+    50022: "Paper path error",
+}
+EVENT_LOG_CODE_NAMES = {
+    "13": "Paper jam error",
+    "21": "Paper punt error",
+    "41.2": "Beam detect malfunction",
+    "41.3": "Unexpected size",
+    "49": "49 error",
+    "50.1": "50.1 fuser error",
+    "50.2": "50.2 fuser error",
+    "50.3": "50.3 fuser error",
+    "50.4": "50.4 fuser error",
+    "50.8": "50.8 fuser error",
+    "50.9": "50.9 fuser error",
+    "50": "All fuser errors",
+    "51.20": "51.20 error",
+    "51.21": "51.21 error",
+    "51.22": "51.22 error",
+    "51.23": "51.23 error",
+    "51": "Laser error",
+    "52": "All scanner errors",
+    "54.1C": "54.1C error",
+    "55.1": "55.1 error",
+    "57": "Fan error",
+    "59.4": "59.4 error",
+    "59.9": "59.9 error",
+    "59.A0": "59.A0 error",
+    "59.C0": "59.C0 error",
+    "79": "79 service",
+}
+EVENT_LOG_PREFIXES = tuple(
+    sorted(
+        EVENT_LOG_CODE_NAMES.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+
+# Errors and structured result types
+
+
+class Cp1215Error(Exception):
+    pass
+
+
+class DeviceAccessError(Cp1215Error):
+    pass
+
+
+class TransientCommunicationError(Cp1215Error):
+    pass
+
+
+class WriteTimeoutError(TransientCommunicationError):
+    pass
+
+
+class NoResponseError(TransientCommunicationError):
+    pass
+
+
+PjlScalar = str | int | bool
+PjlFields = dict[str, PjlScalar]
+Cartridge = dict[str, PjlScalar]
+Event = dict[str, PjlScalar]
+T = TypeVar("T")
+
+
+class SuppliesResult(TypedDict):
+    cartridges: list[Cartridge]
+    raw: str
+
+
+class ConfigResult(TypedDict):
+    raw: str
+    sections: dict[str, list[str]]
+    values: PjlFields
+
+
+class EventLogResult(TypedDict):
+    events: list[Event]
+    raw: str
+
+
+class PageCountResult(TypedDict):
+    page_count: PjlScalar | None
+    raw: str
+
+
+class ScalarResult(TypedDict):
+    value: PjlScalar | None
+    raw: str
+
+
+class CsvResult(TypedDict):
+    raw: str
+    values: dict[str, list[PjlScalar]]
+
+
+class ConfigReport(TypedDict):
+    capabilities: ConfigResult
+    paper: PjlFields
+    print: PjlFields
+    product_settings: PjlFields
+    density_lut: CsvResult
+    color_metrics: CsvResult
+    bow_tilt: CsvResult
+
+
+class InfoReport(TypedDict):
+    pagecount: PageCountResult
+    product: PjlFields
+    tracking: PjlFields
+    memory: PjlFields
+    user_memory: PjlFields
+    service_id: ScalarResult
+    region_id: ScalarResult
+
+
+class DoctorCheck(TypedDict):
+    check: str
+    ok: bool
+    detail: str
+
+
+class DoctorResult(TypedDict):
+    device: str
+    checks: list[DoctorCheck]
+
+
+def snake(name: str) -> str:
+    name = name.strip().replace("-", "_")
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    name = re.sub(r"[^A-Za-z0-9]+", "_", name)
+    return name.strip("_").lower()
+
+
+def decode_response(data: bytes) -> str:
+    text = data.replace(UEL, b"").decode("latin1", "replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip("\x0c\n ")
+
+
+# Device transport
+
+
+def _write_all(fd: int, payload: bytes, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    offset = 0
+
+    while offset < len(payload):
+        try:
+            written = os.write(fd, payload[offset:])
+        except BlockingIOError:
+            written = 0
+
+        if written > 0:
+            offset += written
+            continue
+
+        wait = deadline - time.monotonic()
+        if wait <= 0:
+            raise WriteTimeoutError(
+                f"Timed out writing printer command ({offset} of {len(payload)} bytes sent)"
+            )
+        _, writable, _ = select.select([], [fd], [], min(0.25, wait))
+        if not writable:
+            continue
+
+
+def _transact(
+    payload: bytes,
+    device: str,
+    timeout: float = DEFAULT_COMMAND_TIMEOUT,
+    limit: int = DEFAULT_COMMAND_LIMIT,
+    require_response: bool = False,
+) -> str:
+    flags = os.O_RDWR | os.O_NONBLOCK
+    try:
+        fd = os.open(device, flags)
+    except PermissionError as exc:
+        raise DeviceAccessError(
+            f"Permission denied opening {device}. Add this user to the lp group, "
+            f"adjust udev permissions, or run this command with suitable privileges."
+        ) from exc
+    except FileNotFoundError as exc:
+        raise DeviceAccessError(f"Printer device not found: {device}") from exc
+    except OSError as exc:
+        raise DeviceAccessError(f"Could not open {device}: {exc.strerror or exc}") from exc
+
+    try:
+        if not stat.S_ISCHR(os.fstat(fd).st_mode):
+            raise DeviceAccessError(
+                f"Refusing to use non-character device as printer: {device}"
+            )
+
+        _write_all(fd, payload, timeout)
+        chunks: list[bytes] = []
+        received = 0
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and received < limit:
+            wait = max(0.0, deadline - time.monotonic())
+            readable, _, _ = select.select([fd], [], [], min(0.25, wait))
+            if not readable:
+                continue
+            try:
+                chunk = os.read(fd, min(4096, limit - received))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+            if b"\x0c" in chunk:
+                break
+        if require_response and not chunks:
+            raise NoResponseError(f"No response from {device}")
+        return decode_response(b"".join(chunks))
+    except OSError as exc:
+        raise DeviceAccessError(
+            f"I/O error communicating with {device}: {exc.strerror or exc}"
+        ) from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            # Closing cannot make an already completed command more reliable,
+            # and must not mask a more useful communication error.
+            pass
+
+
+def build_http_get(path: str) -> bytes:
+    return UEL + b"@PJL ENTER LANGUAGE=HTTP\r\nGET " + path.encode("ascii") + b" \r\n\r\n"
+
+
+def build_http_post(path: str, body: bytes) -> bytes:
+    return (
+        UEL
+        + b"@PJL ENTER LANGUAGE=HTTP\r\n"
+        + b"POST "
+        + path.encode("ascii")
+        + b" HTTP/1.1 \r\n"
+        + b"CONTENT-LENGTH:"
+        + str(len(body)).encode("ascii")
+        + b" \r\n\r\n"
+        + body
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Cp1215Client:
+    """Stateless printer client; each transaction opens the configured device."""
+
+    device: str
+
+    def query_pjl(
+        self,
+        command: str,
+        timeout: float = DEFAULT_QUERY_TIMEOUT,
+        limit: int = DEFAULT_QUERY_LIMIT,
+    ) -> str:
+        payload = UEL + command.encode("ascii") + b"\r\n" + UEL
+        return _transact(
+            payload,
+            self.device,
+            timeout,
+            limit,
+            require_response=True,
+        )
+
+    def query_parsed(
+        self,
+        command: str,
+        parser: Callable[[str], T],
+        timeout: float = DEFAULT_QUERY_TIMEOUT,
+        limit: int = DEFAULT_QUERY_LIMIT,
+    ) -> T:
+        return parser(self.query_pjl(command, timeout=timeout, limit=limit))
+
+    def send_pjl_command(
+        self,
+        command: str,
+        timeout: float = DEFAULT_COMMAND_TIMEOUT,
+    ) -> str:
+        payload = UEL + command.encode("ascii") + b"\r\n" + UEL
+        return _transact(
+            payload,
+            self.device,
+            timeout=timeout,
+            limit=DEFAULT_COMMAND_LIMIT,
+            require_response=False,
+        )
+
+    def query_http(
+        self,
+        path: str,
+        timeout: float = DEFAULT_QUERY_TIMEOUT,
+        limit: int = DEFAULT_QUERY_LIMIT,
+    ) -> str:
+        return _transact(
+            build_http_get(path),
+            self.device,
+            timeout=timeout,
+            limit=limit,
+            require_response=True,
+        )
+
+    def post_setting(
+        self,
+        name: str,
+        value: PjlScalar,
+        timeout: float = DEFAULT_COMMAND_TIMEOUT,
+    ) -> str:
+        body = f"\tSID+{name}={value}& \r\n".encode("ascii")
+        return _transact(
+            build_http_post(SSI_CONFIG_PATH, body),
+            self.device,
+            timeout=timeout,
+            limit=DEFAULT_COMMAND_LIMIT,
+        )
+
+    def status_codes(self, timeout: float = DEFAULT_QUERY_TIMEOUT) -> list[int]:
+        response = self.query_http(DEVICE_STATUS_PATH, timeout=timeout)
+        return parse_device_status_codes(response)
+
+
+# Response parsing
+
+
+def parse_key_values(text: str) -> PjlFields:
+    result: PjlFields = {"raw": text}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("@PJL"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip('"')
+        result[snake(key)] = coerce_value(value)
+    return result
+
+
+def coerce_value(value: str) -> PjlScalar:
+    if value in {"TRUE", "FALSE"}:
+        return value == "TRUE"
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    return value
+
+
+def status_code_name(code: PjlScalar | None) -> str | None:
+    return STATUS_CODE_NAMES.get(code) if type(code) is int else None
+
+
+def status_code_label(code: PjlScalar | None) -> str:
+    name = status_code_name(code)
+    if name:
+        return f"{name} ({code})"
+    return str(code)
+
+
+def event_log_code_name(code: PjlScalar | None) -> str | None:
+    code_text = str(code).strip()
+    if not code_text:
+        return None
+    for prefix, name in EVENT_LOG_PREFIXES:
+        normalized_code = code_text.upper()
+        normalized_prefix = prefix.upper()
+        if "." in normalized_prefix:
+            matched = normalized_code == normalized_prefix or normalized_code.startswith(
+                normalized_prefix
+            )
+        else:
+            matched = normalized_code == normalized_prefix or normalized_code.startswith(
+                normalized_prefix + "."
+            )
+        if matched:
+            return name
+    return None
+
+
+def event_log_code_label(code: PjlScalar | None) -> str:
+    name = event_log_code_name(code)
+    if name:
+        return f"{name} ({code})"
+    return str(code)
+
+
+def parse_supplies(text: str) -> SuppliesResult:
+    cartridges: list[Cartridge] = []
+    current: Cartridge | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("@PJL"):
+            continue
+        if line.upper().startswith("CARTRIDGE") and "=" in line:
+            if current:
+                cartridges.append(current)
+            _, value = line.split("=", 1)
+            current = {"color": value.strip()}
+            continue
+        if current is not None and "=" in line:
+            key, value = line.split("=", 1)
+            current[snake(key)] = coerce_value(value.strip())
+
+    if current:
+        cartridges.append(current)
+    return {"cartridges": cartridges, "raw": text}
+
+
+def parse_config(text: str) -> ConfigResult:
+    sections: dict[str, list[str]] = {}
+    values: PjlFields = {}
+    current: str | None = None
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.startswith("@PJL"):
+            continue
+        if raw_line.startswith("\t") and current:
+            sections[current].append(raw_line.strip())
+            continue
+        line = raw_line.strip()
+        match = re.match(r"^(.+?)\s+\[\d+\s+ENUMERATED\]$", line)
+        if match:
+            current = snake(match.group(1))
+            sections[current] = []
+            continue
+        current = None
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[snake(key)] = coerce_value(value.strip())
+    return {"raw": text, "sections": sections, "values": values}
+
+
+def parse_event_log(text: str) -> EventLogResult:
+    events_by_index: dict[int, Event] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("@PJL"):
+            continue
+        if line.upper().startswith("MARSLOGEND"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        match = re.fullmatch(r"([A-Za-z_]+)(\d+)", key.strip())
+        if not match:
+            continue
+        field, index_text = match.groups()
+        index = int(index_text)
+        event = events_by_index.setdefault(index, {"event": index})
+        event[snake(field)] = coerce_value(value.strip())
+
+    events = [events_by_index[index] for index in sorted(events_by_index)]
+    for event in events:
+        if "err_code" in event:
+            event["err_name"] = event_log_code_name(event["err_code"]) or "Unknown"
+            event["err_label"] = event_log_code_label(event["err_code"])
+    return {"events": events, "raw": text}
+
+
+def parse_pagecount(text: str) -> PageCountResult:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("@PJL"):
+            continue
+        if re.fullmatch(r"\d+", line):
+            return {"page_count": int(line), "raw": text}
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if snake(key) == "pagecount":
+                return {"page_count": coerce_value(value.strip()), "raw": text}
+    return {"page_count": None, "raw": text}
+
+
+def parse_memory(text: str) -> PjlFields:
+    data = parse_key_values(text)
+    if "total" in data and "total_bytes" not in data:
+        data["total_bytes"] = data["total"]
+    return data
+
+
+def parse_scalar_response(text: str) -> ScalarResult:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("@PJL"):
+            continue
+        return {"value": coerce_value(line.strip('"')), "raw": text}
+    return {"value": None, "raw": text}
+
+
+def parse_csv_values(text: str) -> CsvResult:
+    values: dict[str, list[PjlScalar]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("@PJL") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        items = [coerce_value(item.strip()) for item in value.split(",")]
+        values[snake(key)] = items
+    return {"raw": text, "values": values}
+
+
+def parse_device_status_codes(text: str) -> list[int]:
+    return [int(code) for code in re.findall(r"<Code>\s*(\d+)\s*</Code>", text)]
+
+
+# Printer operations and report assembly
+
+
+def wait_for_action_complete(
+    client: Cp1215Client,
+    busy_codes: Collection[int],
+    timeout: float,
+    settle_after_status: float = 0.0,
+) -> list[int]:
+    started = time.monotonic()
+    deadline = started + timeout
+    last_codes: list[int] = []
+    saw_busy = False
+    status_clear_time: float | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            codes = client.status_codes(timeout=4.0)
+        except TransientCommunicationError:
+            time.sleep(STATUS_POLL_INTERVAL)
+            continue
+        if codes:
+            last_codes = codes
+            active_codes = [code for code in codes if code]
+            if any(code in busy_codes for code in active_codes):
+                saw_busy = True
+                status_clear_time = None
+            elif saw_busy:
+                if settle_after_status <= 0:
+                    return codes
+                if status_clear_time is None:
+                    status_clear_time = time.monotonic()
+                elif time.monotonic() - status_clear_time >= settle_after_status:
+                    return codes
+            elif active_codes and time.monotonic() - started >= 6.0:
+                return codes
+        time.sleep(STATUS_POLL_INTERVAL)
+
+    if last_codes:
+        last_status = ", ".join(status_code_label(code) for code in last_codes)
+    else:
+        last_status = "no status response"
+    raise Cp1215Error(
+        f"Timed out waiting for printer action to complete; last status: {last_status}"
+    )
+
+
+def wait_for_cleaning_complete(
+    client: Cp1215Client,
+    timeout: float = 180.0,
+) -> list[int]:
+    return wait_for_action_complete(client, CLEANING_BUSY_CODES, timeout=timeout)
+
+
+def wait_for_calibration_complete(
+    client: Cp1215Client,
+    timeout: float = 360.0,
+) -> list[int]:
+    return wait_for_action_complete(
+        client,
+        CALIBRATION_BUSY_CODES,
+        timeout=timeout,
+        settle_after_status=45.0,
+    )
+
+
+def fetch_config(client: Cp1215Client) -> ConfigReport:
+    return {
+        "capabilities": client.query_parsed("@PJL INFO CONFIG", parse_config),
+        "paper": client.query_parsed("@PJL INFO UTPAPER", parse_key_values),
+        "print": client.query_parsed("@PJL INFO UTPRINT", parse_key_values),
+        "product_settings": client.query_parsed(
+            "@PJL INFO UTPRODSETTING",
+            parse_key_values,
+        ),
+        "density_lut": client.query_parsed("@PJL INFO DENSITYLUT", parse_csv_values),
+        "color_metrics": client.query_parsed(
+            "@PJL INFO COLORMETRICS",
+            parse_csv_values,
+        ),
+        "bow_tilt": client.query_parsed("@PJL INFO BOWTILT", parse_csv_values),
+    }
+
+
+def fetch_info(client: Cp1215Client) -> InfoReport:
+    return {
+        "pagecount": client.query_parsed("@PJL INFO PAGECOUNT", parse_pagecount),
+        "product": client.query_parsed("@PJL INFO PRODINFO", parse_key_values),
+        "tracking": client.query_parsed("@PJL INFO TRACKING", parse_key_values),
+        "memory": client.query_parsed("@PJL INFO MEMORY", parse_memory),
+        "user_memory": client.query_parsed("@PJL INFO UTMEMORY", parse_key_values),
+        "service_id": client.query_parsed(
+            "@PJL INQUIRE SERVICEID",
+            parse_scalar_response,
+        ),
+        "region_id": client.query_parsed(
+            "@PJL INQUIRE REGIONID",
+            parse_scalar_response,
+        ),
+    }
+
+
+def fetch_status(client: Cp1215Client) -> PjlFields:
+    data = client.query_parsed("@PJL INFO STATUS", parse_key_values)
+    if "code" in data:
+        data["code_name"] = status_code_name(data["code"]) or "Unknown status code"
+        data["code_label"] = status_code_label(data["code"])
+    return data
+
+
+# Text and JSON rendering
+
+
+def format_table(headers: list[str], rows: list[list[object]]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
+    lines = [fmt.format(*headers), fmt.format(*["-" * width for width in widths])]
+    lines.extend(fmt.format(*[str(cell) for cell in row]) for row in rows)
+    return "\n".join(lines)
+
+
+def print_json(data: object) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def emit(
+    data: T,
+    *,
+    as_json: bool,
+    render_text: Callable[[T], str],
+) -> None:
+    if as_json:
+        print_json(data)
+    else:
+        print(render_text(data))
+
+
+def render_status_text(data: PjlFields) -> str:
+    rows = []
+    derived_fields = {"raw", "code_name", "code_label"}
+    for key, value in data.items():
+        if key not in derived_fields:
+            rows.append([key, status_code_label(value) if key == "code" else value])
+    return format_table(["Field", "Value"], rows)
+
+
+def render_supplies_text(data: SuppliesResult) -> str:
+    rows = [
+        [
+            cartridge.get("color", ""),
+            cartridge.get("percent_remaining", "?"),
+            cartridge.get("pages_remaining", "?"),
+            cartridge.get("type", "?"),
+            cartridge.get("reorder_pn", "?"),
+            cartridge.get("page_count", "?"),
+        ]
+        for cartridge in data["cartridges"]
+    ]
+    return format_table(
+        ["Cartridge", "Remain", "Pages", "Type", "Reorder", "Used"],
+        rows,
+    )
+
+
+def render_config_text(data: ConfigReport) -> str:
+    blocks = []
+    capabilities = data["capabilities"]
+    rows: list[list[object]] = [
+        [key, value] for key, value in capabilities["values"].items()
+    ]
+    for key in ["languages", "resolution", "bitsperpixel", "in_trays"]:
+        values = capabilities["sections"].get(key)
+        if values is not None:
+            rows.append([key, ", ".join(values)])
+    if rows:
+        blocks.append(
+            "Capabilities\n" + format_table(["Field", "Value"], rows)
+        )
+
+    for title, section in [
+        ("Paper Handling", data["paper"]),
+        ("Print Settings", data["print"]),
+        ("Product Settings", data["product_settings"]),
+    ]:
+        rows = [
+            [field, value]
+            for field, value in section.items()
+            if field != "raw"
+        ]
+        if rows:
+            blocks.append(f"{title}\n" + format_table(["Field", "Value"], rows))
+
+    for title, section in [
+        ("Density LUT", data["density_lut"]),
+        ("Color Metrics", data["color_metrics"]),
+        ("Bow/Tilt", data["bow_tilt"]),
+    ]:
+        rows = [
+            [field, ", ".join(str(value) for value in values)]
+            for field, values in section["values"].items()
+        ]
+        if rows:
+            blocks.append(f"{title}\n" + format_table(["Field", "Value"], rows))
+    return "\n\n".join(blocks)
+
+
+def render_events_text(data: EventLogResult) -> str:
+    rows = [
+        [
+            event.get("event", ""),
+            event.get("page_count", ""),
+            event.get("err_code", ""),
+            event.get("err_name", "Unknown"),
+        ]
+        for event in data["events"]
+    ]
+    if not rows:
+        return "No printer event-log entries reported."
+    return format_table(["Event", "Page", "Code", "Meaning"], rows)
+
+
+def render_info_text(data: InfoReport) -> str:
+    blocks = []
+    product = data["product"]
+    rows: list[list[object]] = []
+    for key in [
+        "product_name",
+        "device_description",
+        "product_serial_number",
+        "firmware_date_code",
+        "service_id",
+        "formatter_number",
+        "printer_number",
+        "device_lang",
+        "max_print_resolution",
+    ]:
+        if key in product:
+            rows.append([key, product[key]])
+
+    rows.append(["page_count", data["pagecount"]["page_count"]])
+    memory_value = data["memory"].get("total_bytes", data["memory"].get("total", ""))
+    rows.append(["memory_bytes", memory_value])
+
+    user_memory = data["user_memory"]
+    if "total_memory" in user_memory:
+        rows.append(["user_total_memory_mb", user_memory["total_memory"]])
+    if "available_memory" in user_memory:
+        rows.append(["user_available_memory_mb", user_memory["available_memory"]])
+
+    service_id = data["service_id"]["value"]
+    if service_id not in (None, ""):
+        rows.append(["service_id_inquire", service_id])
+    region_id = data["region_id"]["value"]
+    if region_id not in (None, ""):
+        rows.append(["region_id", region_id])
+    blocks.append("Product\n" + format_table(["Field", "Value"], rows))
+
+    usage_rows = [
+        [key, value]
+        for key, value in data["tracking"].items()
+        if key != "raw"
+    ]
+    if usage_rows:
+        blocks.append("Usage\n" + format_table(["Field", "Value"], usage_rows))
+    return "\n\n".join(blocks)
+
+
+# CLI commands
+
+
+def command_status(args: argparse.Namespace, client: Cp1215Client) -> int:
+    data = fetch_status(client)
+    emit(data, as_json=args.json, render_text=render_status_text)
+    return 0
+
+
+def command_supplies(args: argparse.Namespace, client: Cp1215Client) -> int:
+    data = client.query_parsed("@PJL INFO SUPPLIES", parse_supplies)
+    emit(data, as_json=args.json, render_text=render_supplies_text)
+    return 0
+
+
+def command_config(args: argparse.Namespace, client: Cp1215Client) -> int:
+    data = fetch_config(client)
+    emit(data, as_json=args.json, render_text=render_config_text)
+    return 0
+
+
+def command_events(args: argparse.Namespace, client: Cp1215Client) -> int:
+    data = client.query_parsed("@PJL INFO LOG", parse_event_log)
+    emit(data, as_json=args.json, render_text=render_events_text)
+    return 0
+
+
+def command_info(args: argparse.Namespace, client: Cp1215Client) -> int:
+    data = fetch_info(client)
+    emit(data, as_json=args.json, render_text=render_info_text)
+    return 0
+
+
+def run_service_action(
+    client: Cp1215Client,
+    *,
+    description: str,
+    setting: str,
+    wait_for_completion: Callable[[Cp1215Client], list[int]],
+    final_note: str | None = None,
+) -> int:
+    print(f"Starting {description}...")
+    client.post_setting(setting, 1, timeout=5.0)
+    client.post_setting("FunctionGo", 1, timeout=5.0)
+    codes = wait_for_completion(client)
+    labels = [status_code_label(code) for code in codes if code]
+    print("Final status: " + ", ".join(labels))
+    if final_note:
+        print(final_note)
+    return 0
+
+
+def command_clean(_args: argparse.Namespace, client: Cp1215Client) -> int:
+    return run_service_action(
+        client,
+        description="cleaning cycle",
+        setting="CleaningMode",
+        wait_for_completion=wait_for_cleaning_complete,
+    )
+
+
+def command_calibrate(_args: argparse.Namespace, client: Cp1215Client) -> int:
+    return run_service_action(
+        client,
+        description="calibration",
+        setting="CalibrateAll",
+        wait_for_completion=wait_for_calibration_complete,
+        final_note="Wait for the printer to become quiet before printing.",
+    )
+
+
+def run_doctor(client: Cp1215Client) -> DoctorResult:
+    checks: list[DoctorCheck] = []
+    checks.append(
+        {
+            "check": "Device path",
+            "ok": os.path.exists(client.device),
+            "detail": client.device,
+        }
+    )
+    checks.append(
+        {
+            "check": "Device read/write permission",
+            "ok": os.access(client.device, os.R_OK | os.W_OK),
+            "detail": client.device,
+        }
+    )
+    try:
+        status = client.query_parsed(
+            "@PJL INFO STATUS",
+            parse_key_values,
+            timeout=3.0,
+            limit=4096,
+        )
+        code = status.get("code")
+        online = status.get("online")
+        valid_status = type(code) is int and type(online) is bool
+        checks.append(
+            {
+                "check": "PJL status query",
+                "ok": valid_status,
+                "detail": (
+                    f"code={status_code_label(code)} online={online}"
+                    if valid_status
+                    else (
+                        "Malformed PJL status response: expected integer CODE "
+                        "and boolean ONLINE"
+                    )
+                ),
+            }
+        )
+    except Cp1215Error as exc:
+        checks.append({"check": "PJL status query", "ok": False, "detail": str(exc)})
+    return {"device": client.device, "checks": checks}
+
+
+def render_doctor_text(result: DoctorResult) -> str:
+    rows = [
+        ["OK" if check["ok"] else "FAIL", check["check"], check["detail"]]
+        for check in result["checks"]
+    ]
+    return format_table(["Result", "Check", "Detail"], rows)
+
+
+def command_doctor(args: argparse.Namespace, client: Cp1215Client) -> int:
+    result = run_doctor(client)
+    emit(result, as_json=args.json, render_text=render_doctor_text)
+    return 0 if all(check["ok"] for check in result["checks"]) else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="HP Color LaserJet CP1215 Linux maintenance utility"
+    )
+    parser.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+        help=f"USB printer device, default {DEFAULT_DEVICE}",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for name, func in [
+        ("status", command_status),
+        ("supplies", command_supplies),
+        ("config", command_config),
+        ("events", command_events),
+        ("info", command_info),
+        ("doctor", command_doctor),
+    ]:
+        p = sub.add_parser(name)
+        p.add_argument("--json", action="store_true", help="emit JSON")
+        p.set_defaults(func=func)
+
+    service = sub.add_parser("service", help="run printer service actions")
+    service_sub = service.add_subparsers(dest="service_command", required=True)
+
+    clean = service_sub.add_parser("clean")
+    clean.set_defaults(func=command_clean)
+
+    calibrate = service_sub.add_parser("calibrate")
+    calibrate.set_defaults(func=command_calibrate)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    client = Cp1215Client(args.device)
+    try:
+        return args.func(args, client)
+    except Cp1215Error as exc:
+        print(f"cp1215: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("cp1215: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.pyo
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+
+# Keep proprietary HP/research artifacts out of the release repository.
+*.iso
+*.exe
+*.dll
+*.DLL
+*.cab
+*.CAB
+*.chm
+*.CHM
+*.bin
+*.emf
+*.cat
+*.msi
+*.MSI
+fw_extract/
+fw_2010_extract/
+iso_extract/
+iso_driver/
+windows_7z_extract/
+extracted/
