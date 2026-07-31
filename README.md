@@ -17,8 +17,7 @@ features that are not normally available through the Linux print path.
 - Check device access with `doctor`
 
 The utility is a single Python script and uses only the Python standard
-library. It does not require CUPS, `pycups`, `click`, or any other Python
-package.
+library.
 
 ## Install
 
