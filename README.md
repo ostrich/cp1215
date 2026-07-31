@@ -27,8 +27,6 @@ Clone the repository, then run the script from the checkout:
 ./cp1215 status
 ```
 
-You can also put `cp1215` somewhere on your `PATH`.
-
 ## Usage
 
 Read-only commands:
